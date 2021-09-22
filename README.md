@@ -19,7 +19,7 @@ nginx_log_rotator --config /etc/log_rotate_config.yaml
 cmd:
   - nginx
   - "-g"
-  - "'daemon off;'"
+  - "daemon off;"
 rotate_span: 1800
 rotate_targets:
   - /var/log/mtail/access.log

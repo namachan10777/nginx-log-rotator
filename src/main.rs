@@ -37,7 +37,7 @@ impl Config {
             cmd: vec![
                 "nginx".to_owned(),
                 "-g".to_owned(),
-                "'daemon off;'".to_owned(),
+                "daemon off;".to_owned(),
             ],
             rotate_span: 1800,
             rotate_targets: vec!["/var/log/mtail/access.log".to_owned()],
