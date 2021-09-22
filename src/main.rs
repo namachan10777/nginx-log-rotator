@@ -5,8 +5,13 @@ use nix::unistd::Pid;
 use serde_derive::{Deserialize, Serialize};
 use signal_hook::iterator::Signals;
 use std::fs;
+use std::io::BufRead;
+use std::io::Write;
+use std::io::{self, Read};
+use std::path;
 use std::process::Command;
 use std::thread;
+use std::time::Duration;
 
 #[derive(Clap)]
 #[clap(version = "0.1.0", author = "Masaki Nakano <admin@namachan10777.dev>")]
@@ -21,9 +26,9 @@ struct Opts {
 #[derive(Serialize, Deserialize)]
 struct Config {
     cmd: Vec<String>,
-    rotate_span: usize,
+    rotate_span: u64,
     rotate_targets: Vec<String>,
-    log_inherit_kilobytes: usize,
+    log_inherit_kilobytes: u64,
 }
 
 impl Config {
@@ -42,6 +47,53 @@ impl Config {
 }
 
 use signal_hook::consts::signal as sigs;
+use std::io::Seek;
+
+const CHUNK_SIZE: usize = 2048;
+
+// バックアップファイルのパスを返す
+fn truncate_log(
+    input_path: &path::Path,
+    inherit_kilobytes: u64,
+) -> io::Result<Option<path::PathBuf>> {
+    let mut input = fs::File::open(&input_path)?;
+    let backup_path_str = format!("{}.bak", input_path.to_string_lossy());
+    let output_path_str = format!("{}.next", input_path.to_string_lossy());
+    let backup_path = path::Path::new(&backup_path_str);
+    let output_path = path::Path::new(&output_path_str);
+    let output = fs::File::create(output_path)?;
+    let mut writer = io::BufWriter::new(output);
+    if input.metadata()?.len() <= inherit_kilobytes as u64 {
+        info!("skip truncate {}", input_path.to_string_lossy());
+        return Ok(None);
+    }
+
+    // 後半inherit_kilobytesの位置につける
+    input.seek(io::SeekFrom::End(inherit_kilobytes as i64 * 1024))?;
+
+    let mut reader = io::BufReader::new(input);
+    // 最初の一行は捨てる
+    reader.read_line(&mut String::new())?;
+
+    // CHUNK_SIZE単位で読み書きする
+    let mut buf = Vec::new();
+    buf.resize(CHUNK_SIZE, 0);
+
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(_) => {
+                writer.write_all(&buf)?;
+                buf.clear();
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    writer.flush()?;
+    fs::rename(input_path, backup_path)?;
+    fs::rename(output_path, input_path)?;
+    Ok(Some(backup_path.to_owned()))
+}
 
 fn signal_hook_term_sig_to_nix_signal(sig: i32) -> Option<signal::Signal> {
     match sig {
@@ -100,14 +152,24 @@ const PROPAGATION_SIGNALS: [i32; 24] = [
     sigs::SIGXFSZ,
 ];
 
-fn spawn(exe: &str, args: &[String]) -> Result<(), (String, i32)> {
+fn spawn(
+    exe: &str,
+    args: &[String],
+    truncate_span: Duration,
+    truncate_targets: Vec<String>,
+    inherit_kilobytes: u64,
+) -> Result<(), (String, i32)> {
     let mut child = Command::new(&exe).args(args).spawn().map_err(|e| {
-        (format!(
-            "Failed to execute command {} with args({:?}) due to {:?}",
-            exe, args, e
-        ), -1)
+        (
+            format!(
+                "Failed to execute command {} with args({:?}) due to {:?}",
+                exe, args, e
+            ),
+            -1,
+        )
     })?;
     let pid = child.id();
+    // シグナル中継用のスレッド
     thread::spawn(move || {
         // ハンドル不可能なシグナル(SIGKILL, SIGTSEGV, SIGILL, SIGFPE)を除いて全てのシグナルをキャッチ
         for sig in Signals::new(&PROPAGATION_SIGNALS)
@@ -115,7 +177,7 @@ fn spawn(exe: &str, args: &[String]) -> Result<(), (String, i32)> {
             .forever()
         {
             let recieved_signal = signal_hook_term_sig_to_nix_signal(sig)
-                .expect(&format!("cannot convert signal {}", sig));
+                .unwrap_or_else(|| panic!("cannot convert signal {}", sig));
             // 伝搬
             if let Err(errno) = signal::kill(Pid::from_raw(pid as i32), recieved_signal) {
                 warn!(
@@ -125,6 +187,34 @@ fn spawn(exe: &str, args: &[String]) -> Result<(), (String, i32)> {
             }
         }
     });
+    // ログローテート用のスレッド
+    thread::spawn(move || loop {
+        thread::sleep(truncate_span);
+        match truncate_targets
+            .iter()
+            .map(|target| truncate_log(path::Path::new(target), inherit_kilobytes))
+            .collect::<io::Result<Vec<Option<path::PathBuf>>>>()
+        {
+            Ok(backup_files) => {
+                if let Err(errno) = signal::kill(Pid::from_raw(pid as i32), signal::SIGUSR1) {
+                    error!("Cannot switch log file due to errno {}", errno);
+                }
+                for backup_path in backup_files.into_iter().flatten() {
+                    if let Err(e) = fs::remove_file(&backup_path) {
+                        warn!(
+                            "Cannot remove backup file {} due to {:?}",
+                            backup_path.to_string_lossy(),
+                            e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Cannot truncate log file: {:?}", e);
+            }
+        }
+    });
+    // シグナル中継対象プロセスを見張る
     match child.wait() {
         Ok(status) => {
             if status.success() {
@@ -143,6 +233,7 @@ fn spawn(exe: &str, args: &[String]) -> Result<(), (String, i32)> {
 
 fn run() -> Result<(), (String, i32)> {
     let opts: Opts = Opts::parse();
+    // 設定のexampleを表示
     if opts.example {
         println!("{}", serde_yaml::to_string(&Config::exmaple()).unwrap());
         Ok(())
@@ -156,7 +247,13 @@ fn run() -> Result<(), (String, i32)> {
 
         if let Some(exe) = command.next() {
             let args = command.collect::<Vec<String>>();
-            spawn(&exe, args.as_slice())
+            spawn(
+                &exe,
+                args.as_slice(),
+                Duration::from_secs(config.rotate_span),
+                config.rotate_targets,
+                config.log_inherit_kilobytes,
+            )
         } else {
             Err(("Command is empty".to_owned(), -1))
         }
