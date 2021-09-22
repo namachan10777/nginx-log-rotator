@@ -67,7 +67,7 @@ fn truncate_log(
     let output_path = path::Path::new(&output_path_str);
     let output = fs::File::create(output_path)?;
     let mut writer = io::BufWriter::new(output);
-    if input.metadata()?.len() <= inherit_kilobytes as u64 {
+    if input.metadata()?.len() * 1024 <= inherit_kilobytes as u64 {
         info!("skip truncate {}", input_path.to_string_lossy());
         return Ok(None);
     }
