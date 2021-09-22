@@ -100,21 +100,23 @@ const PROPAGATION_SIGNALS: [i32; 24] = [
     sigs::SIGXFSZ,
 ];
 
-fn spawn(exe: &str, args: &[String]) -> Result<(), String> {
+fn spawn(exe: &str, args: &[String]) -> Result<(), (String, i32)> {
     let mut child = Command::new(&exe).args(args).spawn().map_err(|e| {
-        format!(
+        (format!(
             "Failed to execute command {} with args({:?}) due to {:?}",
             exe, args, e
-        )
+        ), -1)
     })?;
     let pid = child.id();
     thread::spawn(move || {
+        // ハンドル不可能なシグナル(SIGKILL, SIGTSEGV, SIGILL, SIGFPE)を除いて全てのシグナルをキャッチ
         for sig in Signals::new(&PROPAGATION_SIGNALS)
             .expect("Cannot create signals")
             .forever()
         {
             let recieved_signal = signal_hook_term_sig_to_nix_signal(sig)
                 .expect(&format!("cannot convert signal {}", sig));
+            // 伝搬
             if let Err(errno) = signal::kill(Pid::from_raw(pid as i32), recieved_signal) {
                 warn!(
                     "Failed to send signal to child process due to errno({})",
@@ -129,23 +131,26 @@ fn spawn(exe: &str, args: &[String]) -> Result<(), String> {
                 info!("The child process gracefuly exited");
                 Ok(())
             } else {
-                Err(format!("The child process exited with {}", status))
+                Err((
+                    format!("The child process exited with {}", status),
+                    status.code().unwrap_or(-1),
+                ))
             }
         }
-        Err(e) => Err(format!("Unknown err {:?}", e)),
+        Err(e) => Err((format!("Unknown err {:?}", e), -1)),
     }
 }
 
-fn run() -> Result<(), String> {
+fn run() -> Result<(), (String, i32)> {
     let opts: Opts = Opts::parse();
     if opts.example {
         println!("{}", serde_yaml::to_string(&Config::exmaple()).unwrap());
         Ok(())
     } else if let Some(config) = opts.config {
         let config: Config = serde_yaml::from_str(
-            &fs::read_to_string(config).map_err(|_| "Cannot read config file".to_owned())?,
+            &fs::read_to_string(config).map_err(|_| ("Cannot read config file".to_owned(), -1))?,
         )
-        .map_err(|_| "Invalid config file".to_owned())?;
+        .map_err(|_| ("Invalid config file".to_owned(), -1))?;
 
         let mut command = config.cmd.into_iter();
 
@@ -153,17 +158,17 @@ fn run() -> Result<(), String> {
             let args = command.collect::<Vec<String>>();
             spawn(&exe, args.as_slice())
         } else {
-            Err("Command is empty".to_owned())
+            Err(("Command is empty".to_owned(), -1))
         }
     } else {
-        Err("--config option must be passed".to_owned())
+        Err(("--config option must be passed".to_owned(), -1))
     }
 }
 
 fn main() {
     env_logger::init();
-    if let Err(msg) = run() {
+    if let Err((msg, exit)) = run() {
         error!("{}", msg);
-        std::process::exit(-1);
+        std::process::exit(exit);
     }
 }
