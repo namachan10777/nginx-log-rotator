@@ -56,6 +56,10 @@ fn truncate_log(
     input_path: &path::Path,
     inherit_kilobytes: u64,
 ) -> io::Result<Option<path::PathBuf>> {
+    if !input_path.exists() {
+        warn!("Log file {} does not exist", input_path.to_string_lossy());
+        return Ok(None)
+    }
     let mut input = fs::File::open(&input_path)?;
     let backup_path_str = format!("{}.bak", input_path.to_string_lossy());
     let output_path_str = format!("{}.next", input_path.to_string_lossy());
